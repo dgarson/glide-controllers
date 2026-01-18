@@ -38,6 +38,11 @@ type Context struct {
 	// Methods will no-op if the object doesn't support conditions.
 	Conditions ConditionHelper
 
+	// Owned provides utilities for managing child resources owned by
+	// the reconciled object. It automatically sets controller references
+	// and provides convenient create/update/delete operations.
+	Owned OwnedResourceHelper
+
 	// Object provides direct access to the object being reconciled.
 	// This is the same object passed to Sync/Finalize, provided here
 	// for convenience when using helper methods.
@@ -46,7 +51,7 @@ type Context struct {
 
 // NewContext creates a new Context for handler execution.
 // This is typically called by the framework, not by user code.
-func NewContext(c client.Client, log logr.Logger, eventRecorder record.EventRecorder, obj runtime.Object) *Context {
+func NewContext(c client.Client, scheme *runtime.Scheme, log logr.Logger, eventRecorder record.EventRecorder, obj runtime.Object) *Context {
 	clientObj := obj.(client.Object)
 	return &Context{
 		Client: c,
@@ -57,6 +62,7 @@ func NewContext(c client.Client, log logr.Logger, eventRecorder record.EventReco
 		},
 		Status:     newStatusHelper(clientObj),
 		Conditions: newConditionHelper(clientObj),
+		Owned:      newOwnedResourceHelper(c, scheme, clientObj),
 		Object:     clientObj,
 	}
 }

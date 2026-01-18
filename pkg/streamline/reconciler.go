@@ -172,7 +172,7 @@ func (r *GenericReconciler[T]) reconcileNormal(ctx context.Context, obj T, log l
 	original := obj.DeepCopyObject().(client.Object)
 
 	// Step 5: Create the streamline context for the handler
-	sCtx := NewContext(r.Client, log, r.EventRecorder, obj)
+	sCtx := NewContext(r.Client, r.Scheme, log, r.EventRecorder, obj)
 
 	// Step 6: Call Sync
 	result, err := r.Handler.Sync(ctx, obj, sCtx)
@@ -215,7 +215,7 @@ func (r *GenericReconciler[T]) reconcileDelete(ctx context.Context, obj T, log l
 		original := obj.DeepCopyObject().(client.Object)
 
 		// Step 5: Create the streamline context for the handler
-		sCtx := NewContext(r.Client, log, r.EventRecorder, obj)
+		sCtx := NewContext(r.Client, r.Scheme, log, r.EventRecorder, obj)
 
 		// Step 6: Call Finalize
 		fh := any(r.Handler).(FinalizingHandler[T])

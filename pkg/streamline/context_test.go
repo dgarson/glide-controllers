@@ -49,6 +49,7 @@ var _ record.EventRecorder = &mockEventRecorder{}
 func TestNewContext(t *testing.T) {
 	recorder := &mockEventRecorder{}
 	log := logr.Discard()
+	scheme := runtime.NewScheme()
 	obj := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-pod",
@@ -56,13 +57,16 @@ func TestNewContext(t *testing.T) {
 		},
 	}
 
-	ctx := NewContext(nil, log, recorder, obj)
+	ctx := NewContext(nil, scheme, log, recorder, obj)
 
 	if ctx == nil {
 		t.Fatal("NewContext returned nil")
 	}
 	if ctx.Event == nil {
 		t.Error("NewContext should set Event")
+	}
+	if ctx.Owned == nil {
+		t.Error("NewContext should set Owned")
 	}
 }
 
