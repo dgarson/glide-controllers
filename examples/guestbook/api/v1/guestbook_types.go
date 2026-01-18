@@ -24,6 +24,10 @@ type GuestbookSpec struct {
 
 // GuestbookStatus defines the observed state of Guestbook.
 type GuestbookStatus struct {
+	// ObservedGeneration reflects the generation of the most recently observed spec.
+	// This is automatically updated by the Streamline framework.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
 	// Phase represents the current lifecycle phase of the Guestbook.
 	// +kubebuilder:validation:Enum=Pending;Running;Failed;Terminating
 	Phase string `json:"phase,omitempty"`
@@ -39,6 +43,9 @@ type GuestbookStatus struct {
 
 	// LastUpdated is the timestamp of the last status update.
 	LastUpdated metav1.Time `json:"lastUpdated,omitempty"`
+
+	// Conditions represent the latest available observations of the Guestbook's state.
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -64,4 +71,49 @@ type GuestbookList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []Guestbook `json:"items"`
+}
+
+// Implement streamline.ObjectWithObservedGeneration for automatic generation tracking.
+func (g *Guestbook) GetObservedGeneration() int64 {
+	return g.Status.ObservedGeneration
+}
+
+func (g *Guestbook) SetObservedGeneration(gen int64) {
+	g.Status.ObservedGeneration = gen
+}
+
+// Implement streamline.ObjectWithPhase for status helpers.
+func (g *Guestbook) GetPhase() string {
+	return g.Status.Phase
+}
+
+func (g *Guestbook) SetPhase(phase string) {
+	g.Status.Phase = phase
+}
+
+// Implement streamline.ObjectWithMessage for status helpers.
+func (g *Guestbook) GetMessage() string {
+	return g.Status.Message
+}
+
+func (g *Guestbook) SetMessage(msg string) {
+	g.Status.Message = msg
+}
+
+// Implement streamline.ObjectWithLastUpdated for status helpers.
+func (g *Guestbook) GetLastUpdated() metav1.Time {
+	return g.Status.LastUpdated
+}
+
+func (g *Guestbook) SetLastUpdated(t metav1.Time) {
+	g.Status.LastUpdated = t
+}
+
+// Implement streamline.ObjectWithConditions for condition management.
+func (g *Guestbook) GetConditions() []metav1.Condition {
+	return g.Status.Conditions
+}
+
+func (g *Guestbook) SetConditions(conditions []metav1.Condition) {
+	g.Status.Conditions = conditions
 }

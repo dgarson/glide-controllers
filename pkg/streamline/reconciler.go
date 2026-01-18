@@ -25,6 +25,7 @@ const FinalizerName = "streamline.io/finalizer"
 //   - Snapshot before handler execution for patch calculation
 //   - Lifecycle routing (deletion vs sync paths)
 //   - Smart status patching using MergePatch
+//   - Automatic observedGeneration tracking (optional)
 //   - Result translation
 //
 // Use NewGenericReconciler to create instances.
@@ -49,6 +50,13 @@ type GenericReconciler[T client.Object] struct {
 
 	// isFinalizingHandler caches whether the handler implements FinalizingHandler.
 	isFinalizingHandler bool
+
+	// autoUpdateObservedGeneration enables automatic updating of status.observedGeneration
+	// after successful sync operations. When enabled, if the object implements
+	// ObjectWithObservedGeneration, the framework will automatically set
+	// observedGeneration to match the object's generation after Sync completes
+	// without error.
+	autoUpdateObservedGeneration bool
 }
 
 // NewGenericReconciler creates a new GenericReconciler for the given handler.
@@ -79,14 +87,29 @@ func NewGenericReconciler[T client.Object](
 	_, isFinalizingHandler := any(handler).(FinalizingHandler[T])
 
 	return &GenericReconciler[T]{
-		Client:              c,
-		Handler:             handler,
-		Scheme:              scheme,
-		EventRecorder:       eventRecorder,
-		Log:                 log,
-		objType:             objType,
-		isFinalizingHandler: isFinalizingHandler,
+		Client:                       c,
+		Handler:                      handler,
+		Scheme:                       scheme,
+		EventRecorder:                eventRecorder,
+		Log:                          log,
+		objType:                      objType,
+		isFinalizingHandler:          isFinalizingHandler,
+		autoUpdateObservedGeneration: true, // Enabled by default
 	}
+}
+
+// WithAutoObservedGeneration configures whether the reconciler should automatically
+// update status.observedGeneration after successful sync operations.
+// This is enabled by default. Disable it if you want to manage observedGeneration
+// manually in your handler.
+//
+// Example:
+//
+//	reconciler := streamline.NewGenericReconciler[*v1.MyResource](...)
+//	reconciler.WithAutoObservedGeneration(false) // Disable auto-update
+func (r *GenericReconciler[T]) WithAutoObservedGeneration(enabled bool) *GenericReconciler[T] {
+	r.autoUpdateObservedGeneration = enabled
+	return r
 }
 
 // Reconcile implements reconcile.Reconciler.
@@ -156,6 +179,11 @@ func (r *GenericReconciler[T]) reconcileNormal(ctx context.Context, obj T, log l
 	if err != nil {
 		log.Error(err, "sync returned error")
 		return ctrl.Result{}, err
+	}
+
+	// Step 6a: Auto-update observedGeneration if enabled and successful
+	if r.autoUpdateObservedGeneration {
+		r.updateObservedGeneration(obj, log)
 	}
 
 	// Step 7: Calculate and apply status patch if status changed
@@ -229,6 +257,19 @@ func (r *GenericReconciler[T]) newObject() T {
 	// Create a new instance of the underlying struct type
 	newObj := reflect.New(r.objType).Interface()
 	return newObj.(T)
+}
+
+// updateObservedGeneration sets status.observedGeneration to match metadata.generation
+// if the object implements ObjectWithObservedGeneration.
+func (r *GenericReconciler[T]) updateObservedGeneration(obj T, log logr.Logger) {
+	if owog, ok := any(obj).(ObjectWithObservedGeneration); ok {
+		generation := obj.GetGeneration()
+		currentObserved := owog.GetObservedGeneration()
+		if currentObserved != generation {
+			owog.SetObservedGeneration(generation)
+			log.V(1).Info("updated observedGeneration", "generation", generation)
+		}
+	}
 }
 
 // patchStatus calculates the diff between original and current object,

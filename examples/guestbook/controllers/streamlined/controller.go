@@ -1,17 +1,24 @@
 // Package streamlined demonstrates a Streamline-based controller implementation.
 // Compare this with the standard package to see the reduction in boilerplate.
 //
-// Lines of Code: ~55 (excluding comments) - 54% reduction from standard (~120 lines)
+// This version demonstrates the use of StatusHelper and ConditionHelper
+// for cleaner status management.
 package streamlined
 
 import (
 	"context"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	guestbookv1 "github.com/streamline-controllers/streamline/examples/guestbook/api/v1"
 	"github.com/streamline-controllers/streamline/pkg/streamline"
+)
+
+// Phase constants for Guestbook status.
+const (
+	PhasePending     = "Pending"
+	PhaseRunning     = "Running"
+	PhaseFailed      = "Failed"
+	PhaseTerminating = "Terminating"
 )
 
 // GuestbookHandler implements the business logic for Guestbook resources.
@@ -24,11 +31,18 @@ var _ streamline.FinalizingHandler[*guestbookv1.Guestbook] = &GuestbookHandler{}
 
 // Sync handles creation and update events.
 // The object is guaranteed to exist and not be marked for deletion.
+//
+// Note: observedGeneration is automatically updated by the framework after
+// Sync returns without error, since Guestbook implements ObjectWithObservedGeneration.
 func (h *GuestbookHandler) Sync(ctx context.Context, guestbook *guestbookv1.Guestbook, sCtx *streamline.Context) (streamline.Result, error) {
-	// Validate spec
+	// Use the Conditions helper to set Progressing condition
+	sCtx.Conditions.SetProgressing(streamline.ReasonReconciling, "Reconciling guestbook")
+
+	// Validate spec using Status helper for clean phase/message setting
 	if guestbook.Spec.Replicas < 1 {
-		guestbook.Status.Phase = "Failed"
-		guestbook.Status.Message = "Replicas must be at least 1"
+		sCtx.Status.SetPhaseWithMessage(PhaseFailed, "Replicas must be at least 1")
+		sCtx.Conditions.SetNotReady(streamline.ReasonInvalidSpec, "Replicas must be at least 1")
+		sCtx.Conditions.ClearProgressing(streamline.ReasonReconcileFailed, "Validation failed")
 		sCtx.Event.Warning("InvalidSpec", "Replicas must be at least 1")
 		return streamline.Stop(), nil
 	}
@@ -40,13 +54,21 @@ func (h *GuestbookHandler) Sync(ctx context.Context, guestbook *guestbookv1.Gues
 		sCtx.Event.Normal("ExternalResourceCreated", "Created external resource")
 	}
 
-	// Update status
-	guestbook.Status.Phase = "Running"
+	// Update status using helpers
+	sCtx.Status.SetPhaseWithMessage(PhaseRunning, guestbook.Spec.Message)
+	sCtx.Status.SetLastUpdated()
 	guestbook.Status.ReadyReplicas = guestbook.Spec.Replicas
-	guestbook.Status.Message = guestbook.Spec.Message
-	guestbook.Status.LastUpdated = metav1.Now()
+
+	// Set Ready condition
+	sCtx.Conditions.SetReady(streamline.ReasonReady, "Guestbook is running")
+	sCtx.Conditions.ClearProgressing(streamline.ReasonReconcileSuccess, "Reconciliation complete")
 
 	sCtx.Event.Normal("Synced", "Guestbook synced successfully")
+
+	// Log generation info for debugging
+	sCtx.Log.V(1).Info("Sync complete",
+		"generation", sCtx.Status.Generation(),
+		"isUpToDate", sCtx.Status.IsUpToDate())
 
 	// Requeue after 5 minutes for periodic reconciliation
 	return streamline.RequeueAfter(5 * time.Minute), nil
@@ -58,8 +80,9 @@ func (h *GuestbookHandler) Finalize(ctx context.Context, guestbook *guestbookv1.
 	// Simulate external resource cleanup
 	if guestbook.Spec.ExternalResource != "" && guestbook.Status.ExternalResourceCreated {
 		sCtx.Log.Info("Cleaning up external resource", "resource", guestbook.Spec.ExternalResource)
-		guestbook.Status.Phase = "Terminating"
-		guestbook.Status.Message = "Cleaning up external resources"
+
+		// Use Status helper for phase/message
+		sCtx.Status.SetPhaseWithMessage(PhaseTerminating, "Cleaning up external resources")
 		sCtx.Event.Normal("Finalizing", "Cleaning up external resource")
 
 		// In a real scenario, this would call an external API

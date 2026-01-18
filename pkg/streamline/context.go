@@ -26,11 +26,28 @@ type Context struct {
 	// Event provides a simplified interface for recording Kubernetes events.
 	// Events are automatically associated with the resource being reconciled.
 	Event EventHelper
+
+	// Status provides utilities for managing common status fields like
+	// observedGeneration, phase, and lastUpdated.
+	// Available for all objects, but methods will no-op if the object
+	// doesn't implement the corresponding interface.
+	Status StatusHelper
+
+	// Conditions provides utilities for managing standard Kubernetes conditions.
+	// Available for objects that implement ObjectWithConditions.
+	// Methods will no-op if the object doesn't support conditions.
+	Conditions ConditionHelper
+
+	// Object provides direct access to the object being reconciled.
+	// This is the same object passed to Sync/Finalize, provided here
+	// for convenience when using helper methods.
+	Object client.Object
 }
 
 // NewContext creates a new Context for handler execution.
 // This is typically called by the framework, not by user code.
 func NewContext(c client.Client, log logr.Logger, eventRecorder record.EventRecorder, obj runtime.Object) *Context {
+	clientObj := obj.(client.Object)
 	return &Context{
 		Client: c,
 		Log:    log,
@@ -38,6 +55,9 @@ func NewContext(c client.Client, log logr.Logger, eventRecorder record.EventReco
 			recorder: eventRecorder,
 			object:   obj,
 		},
+		Status:     newStatusHelper(clientObj),
+		Conditions: newConditionHelper(clientObj),
+		Object:     clientObj,
 	}
 }
 
