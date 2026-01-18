@@ -151,13 +151,16 @@ func (r *dryRunRecorder) RecordUpdate(before, after client.Object, description s
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.changes = append(r.changes, DryRunChange{
+	change := DryRunChange{
 		Action:      DryRunActionUpdate,
 		Object:      after.DeepCopyObject().(client.Object),
 		Description: description,
-		Before:      before.DeepCopyObject().(client.Object),
 		After:       after.DeepCopyObject().(client.Object),
-	})
+	}
+	if before != nil {
+		change.Before = before.DeepCopyObject().(client.Object)
+	}
+	r.changes = append(r.changes, change)
 }
 
 func (r *dryRunRecorder) RecordDelete(obj client.Object, description string) {
