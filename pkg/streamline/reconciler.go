@@ -26,6 +26,9 @@ const FinalizerName = "streamline.io/finalizer"
 //   - Lifecycle routing (deletion vs sync paths)
 //   - Smart status patching using MergePatch
 //   - Automatic observedGeneration tracking (optional)
+//   - Optional pause annotation support
+//   - Optional metrics collection
+//   - Error classification for intelligent retry behavior
 //   - Result translation
 //
 // Use NewGenericReconciler to create instances.
@@ -57,6 +60,24 @@ type GenericReconciler[T client.Object] struct {
 	// observedGeneration to match the object's generation after Sync completes
 	// without error.
 	autoUpdateObservedGeneration bool
+
+	// pauseEnabled controls whether pause annotation checking is enabled.
+	pauseEnabled bool
+
+	// pauseHandler is called when an object is paused/resumed.
+	pauseHandler PauseHandler
+
+	// metrics is the optional metrics provider.
+	metrics MetricsProvider
+
+	// controllerName is used for metrics labeling.
+	controllerName string
+
+	// backoffTracker tracks per-resource backoff state.
+	backoffTracker BackoffTracker
+
+	// healthReporter reports controller health status.
+	healthReporter HealthReporter
 }
 
 // NewGenericReconciler creates a new GenericReconciler for the given handler.
@@ -112,6 +133,56 @@ func (r *GenericReconciler[T]) WithAutoObservedGeneration(enabled bool) *Generic
 	return r
 }
 
+// WithPauseSupport enables pause annotation checking.
+// When enabled, the reconciler will skip reconciliation for objects with the
+// streamline.io/paused=true annotation.
+//
+// Example:
+//
+//	reconciler := streamline.NewGenericReconciler[*v1.MyResource](...)
+//	reconciler.WithPauseSupport(true)
+func (r *GenericReconciler[T]) WithPauseSupport(enabled bool) *GenericReconciler[T] {
+	r.pauseEnabled = enabled
+	if enabled && r.pauseHandler == nil {
+		r.pauseHandler = &DefaultPauseHandler{}
+	}
+	return r
+}
+
+// WithPauseHandler sets a custom pause handler.
+// Also enables pause support if not already enabled.
+func (r *GenericReconciler[T]) WithPauseHandler(handler PauseHandler) *GenericReconciler[T] {
+	r.pauseHandler = handler
+	r.pauseEnabled = true
+	return r
+}
+
+// WithMetrics enables metrics collection with the given provider.
+// If provider is nil, metrics are disabled.
+//
+// Example:
+//
+//	metrics := streamline.NewMetricsProvider(nil)
+//	reconciler := streamline.NewGenericReconciler[*v1.MyResource](...)
+//	reconciler.WithMetrics(metrics, "mycontroller")
+func (r *GenericReconciler[T]) WithMetrics(provider MetricsProvider, controllerName string) *GenericReconciler[T] {
+	r.metrics = provider
+	r.controllerName = controllerName
+	return r
+}
+
+// WithBackoffTracker sets a custom backoff tracker for per-resource retry tracking.
+func (r *GenericReconciler[T]) WithBackoffTracker(tracker BackoffTracker) *GenericReconciler[T] {
+	r.backoffTracker = tracker
+	return r
+}
+
+// WithHealthReporter sets a health reporter for the reconciler.
+func (r *GenericReconciler[T]) WithHealthReporter(reporter HealthReporter) *GenericReconciler[T] {
+	r.healthReporter = reporter
+	return r
+}
+
 // Reconcile implements reconcile.Reconciler.
 // It handles the full reconciliation workflow:
 //  1. Instantiate a new instance of T
@@ -154,7 +225,29 @@ func (r *GenericReconciler[T]) Reconcile(ctx context.Context, req ctrl.Request) 
 // reconcileNormal handles the normal (non-deletion) reconciliation path.
 // It ensures the finalizer is present if needed, then calls Sync.
 func (r *GenericReconciler[T]) reconcileNormal(ctx context.Context, obj T, log logr.Logger) (ctrl.Result, error) {
-	// Step 3a: If handler implements FinalizingHandler, ensure finalizer is present
+	// Step 3a: Check if paused
+	if r.pauseEnabled {
+		if pauseResult := CheckPauseAndSkip(obj); pauseResult != nil {
+			log.V(1).Info("object is paused", "message", pauseResult.Message)
+			// Call pause handler if configured
+			if r.pauseHandler != nil {
+				original := obj.DeepCopyObject().(client.Object)
+				sCtx := NewContextWithScheme(r.Client, log, r.EventRecorder, obj, r.Scheme)
+				r.pauseHandler.OnPause(obj, sCtx)
+				// Patch status to persist pause condition
+				if err := r.patchStatus(ctx, obj, original); err != nil {
+					log.Error(err, "failed to patch status for paused object")
+				}
+			}
+			// Record metrics if enabled
+			if r.metrics != nil {
+				r.metrics.RecordReconcileTotal(r.controllerName, OutcomeSkipped)
+			}
+			return pauseResult.Result.ToCtrlResult(), nil
+		}
+	}
+
+	// Step 3b: If handler implements FinalizingHandler, ensure finalizer is present
 	if r.isFinalizingHandler {
 		if !controllerutil.ContainsFinalizer(obj, FinalizerName) {
 			log.V(1).Info("adding finalizer")
@@ -171,14 +264,54 @@ func (r *GenericReconciler[T]) reconcileNormal(ctx context.Context, obj T, log l
 	// Step 4: Snapshot the object for patch calculation
 	original := obj.DeepCopyObject().(client.Object)
 
-	// Step 5: Create the streamline context for the handler
-	sCtx := NewContext(r.Client, log, r.EventRecorder, obj)
+	// Step 5: Create the streamline context for the handler with scheme support
+	sCtx := NewContextWithScheme(r.Client, log, r.EventRecorder, obj, r.Scheme)
 
 	// Step 6: Call Sync
 	result, err := r.Handler.Sync(ctx, obj, sCtx)
 	if err != nil {
 		log.Error(err, "sync returned error")
+
+		// Handle classified errors
+		classification := ClassifyError(err)
+		log.V(1).Info("error classified", "classification", classification.String())
+
+		// Record metrics if enabled
+		if r.metrics != nil {
+			r.metrics.RecordReconcileTotal(r.controllerName, OutcomeError)
+		}
+
+		// Track backoff if configured
+		if r.backoffTracker != nil {
+			key := client.ObjectKeyFromObject(obj)
+			r.backoffTracker.RecordFailure(key)
+
+			// Use backoff delay if available
+			if retryAfter := GetRetryAfter(err); retryAfter > 0 {
+				return ctrl.Result{RequeueAfter: retryAfter}, nil
+			}
+			if backoff := r.backoffTracker.GetBackoff(key); backoff > 0 {
+				return ctrl.Result{RequeueAfter: backoff}, nil
+			}
+		}
+
+		// For permanent errors, don't requeue
+		if classification == ErrorPermanent || classification == ErrorTerminal {
+			// Set error condition
+			sCtx.Conditions.SetFalse(ConditionTypeReady, GetErrorReason(err), GetErrorMessage(err))
+			if patchErr := r.patchStatus(ctx, obj, original); patchErr != nil {
+				log.Error(patchErr, "failed to patch status after permanent error")
+			}
+			return ctrl.Result{}, nil // Don't requeue permanent errors
+		}
+
 		return ctrl.Result{}, err
+	}
+
+	// Clear backoff on success
+	if r.backoffTracker != nil {
+		key := client.ObjectKeyFromObject(obj)
+		r.backoffTracker.RecordSuccess(key)
 	}
 
 	// Step 6a: Auto-update observedGeneration if enabled and successful
@@ -190,6 +323,15 @@ func (r *GenericReconciler[T]) reconcileNormal(ctx context.Context, obj T, log l
 	if err := r.patchStatus(ctx, obj, original); err != nil {
 		log.Error(err, "failed to patch status")
 		return ctrl.Result{}, err
+	}
+
+	// Record success metrics
+	if r.metrics != nil {
+		if result.IsZero() {
+			r.metrics.RecordReconcileTotal(r.controllerName, OutcomeSuccess)
+		} else {
+			r.metrics.RecordReconcileTotal(r.controllerName, OutcomeRequeue)
+		}
 	}
 
 	// Step 8: Translate and return result
@@ -214,14 +356,20 @@ func (r *GenericReconciler[T]) reconcileDelete(ctx context.Context, obj T, log l
 		// Step 4: Snapshot the object for patch calculation
 		original := obj.DeepCopyObject().(client.Object)
 
-		// Step 5: Create the streamline context for the handler
-		sCtx := NewContext(r.Client, log, r.EventRecorder, obj)
+		// Step 5: Create the streamline context for the handler with scheme support
+		sCtx := NewContextWithScheme(r.Client, log, r.EventRecorder, obj, r.Scheme)
 
 		// Step 6: Call Finalize
 		fh := any(r.Handler).(FinalizingHandler[T])
 		result, err := fh.Finalize(ctx, obj, sCtx)
 		if err != nil {
 			log.Error(err, "finalize returned error")
+
+			// Record metrics if enabled
+			if r.metrics != nil {
+				r.metrics.RecordReconcileTotal(r.controllerName, OutcomeError)
+			}
+
 			return ctrl.Result{}, err
 		}
 
@@ -245,6 +393,11 @@ func (r *GenericReconciler[T]) reconcileDelete(ctx context.Context, obj T, log l
 	if err := r.Client.Update(ctx, obj); err != nil {
 		log.Error(err, "failed to remove finalizer")
 		return ctrl.Result{}, err
+	}
+
+	// Record success metrics
+	if r.metrics != nil {
+		r.metrics.RecordReconcileTotal(r.controllerName, OutcomeSuccess)
 	}
 
 	log.V(1).Info("finalizer removed, deletion can proceed")
