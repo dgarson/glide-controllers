@@ -42,6 +42,19 @@ type Context struct {
 	// This is the same object passed to Sync/Finalize, provided here
 	// for convenience when using helper methods.
 	Object client.Object
+
+	// Resources provides utilities for managing owned/child resources.
+	// Only available when the context is created with a scheme.
+	// Use this to create, update, and delete resources owned by the parent.
+	Resources ResourceManager
+
+	// Pause provides utilities for checking and managing pause state.
+	// Use this to check if reconciliation is paused and handle accordingly.
+	Pause PauseChecker
+
+	// Scheme is the runtime scheme for type information.
+	// Available for advanced use cases.
+	Scheme *runtime.Scheme
 }
 
 // NewContext creates a new Context for handler execution.
@@ -58,7 +71,45 @@ func NewContext(c client.Client, log logr.Logger, eventRecorder record.EventReco
 		Status:     newStatusHelper(clientObj),
 		Conditions: newConditionHelper(clientObj),
 		Object:     clientObj,
+		Pause:      NewPauseChecker(clientObj),
 	}
+}
+
+// NewContextWithScheme creates a new Context with scheme support for resource management.
+// This is typically called by the framework, not by user code.
+func NewContextWithScheme(c client.Client, log logr.Logger, eventRecorder record.EventRecorder, obj runtime.Object, scheme *runtime.Scheme) *Context {
+	clientObj := obj.(client.Object)
+	ctx := &Context{
+		Client: c,
+		Log:    log,
+		Event: &eventHelper{
+			recorder: eventRecorder,
+			object:   obj,
+		},
+		Status:     newStatusHelper(clientObj),
+		Conditions: newConditionHelper(clientObj),
+		Object:     clientObj,
+		Pause:      NewPauseChecker(clientObj),
+		Scheme:     scheme,
+	}
+
+	// Initialize ResourceManager if scheme is provided
+	if scheme != nil {
+		ctx.Resources = NewResourceManager(c, scheme, clientObj, log)
+	}
+
+	return ctx
+}
+
+// IsPaused returns true if the current object is paused.
+func (c *Context) IsPaused() bool {
+	return c.Pause.IsPaused()
+}
+
+// CheckPause checks if the object is paused and returns information about how to handle it.
+// If paused, returns a non-nil PauseReconcileResult with appropriate requeue behavior.
+func (c *Context) CheckPause() *PauseReconcileResult {
+	return CheckPauseAndSkip(c.Object)
 }
 
 // EventHelper provides a simplified interface for recording Kubernetes events.
