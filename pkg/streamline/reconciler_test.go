@@ -17,7 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// testObject is a simple object for testing.
+// testHandler is a simple handler for testing.
 // We use corev1.ConfigMap as it's a standard Kubernetes type.
 type testHandler struct {
 	syncFunc     func(ctx context.Context, obj *corev1.ConfigMap, sCtx *Context) (Result, error)
@@ -51,12 +51,20 @@ var _ FinalizingHandler[*corev1.ConfigMap] = &testFinalizingHandler{}
 type fakeClient struct {
 	client.Client
 	getFunc         func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error
+	updateFunc      func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error
 	statusPatchFunc func(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error
 }
 
 func (f *fakeClient) Get(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
 	if f.getFunc != nil {
 		return f.getFunc(ctx, key, obj, opts...)
+	}
+	return nil
+}
+
+func (f *fakeClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if f.updateFunc != nil {
+		return f.updateFunc(ctx, obj, opts...)
 	}
 	return nil
 }
@@ -102,6 +110,24 @@ func TestNewGenericReconciler(t *testing.T) {
 	}
 	if reconciler.Scheme != scheme {
 		t.Error("Scheme not set correctly")
+	}
+	if reconciler.isFinalizingHandler {
+		t.Error("isFinalizingHandler should be false for testHandler")
+	}
+}
+
+func TestNewGenericReconciler_WithFinalizingHandler(t *testing.T) {
+	handler := &testFinalizingHandler{}
+	reconciler := NewGenericReconciler[*corev1.ConfigMap](
+		&fakeClient{},
+		handler,
+		runtime.NewScheme(),
+		&mockEventRecorder{},
+		logr.Discard(),
+	)
+
+	if !reconciler.isFinalizingHandler {
+		t.Error("isFinalizingHandler should be true for testFinalizingHandler")
 	}
 }
 
@@ -242,6 +268,129 @@ func TestGenericReconciler_Reconcile_SyncError(t *testing.T) {
 	}
 }
 
+func TestGenericReconciler_Reconcile_AddFinalizer(t *testing.T) {
+	// When handler implements FinalizingHandler and object doesn't have finalizer,
+	// it should add the finalizer and requeue
+	updateCalled := false
+	var updatedObj client.Object
+
+	handler := &testFinalizingHandler{
+		testHandler: testHandler{
+			syncFunc: func(ctx context.Context, obj *corev1.ConfigMap, sCtx *Context) (Result, error) {
+				t.Error("Sync should not be called when adding finalizer")
+				return Stop(), nil
+			},
+		},
+	}
+
+	fc := &fakeClient{
+		getFunc: func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+			cm := obj.(*corev1.ConfigMap)
+			cm.Name = "test"
+			cm.Namespace = "default"
+			// No finalizer present
+			return nil
+		},
+		updateFunc: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+			updateCalled = true
+			updatedObj = obj
+			return nil
+		},
+	}
+
+	reconciler := NewGenericReconciler[*corev1.ConfigMap](
+		fc,
+		handler,
+		runtime.NewScheme(),
+		&mockEventRecorder{},
+		logr.Discard(),
+	)
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "test"},
+	})
+
+	if err != nil {
+		t.Errorf("Reconcile should not return error, got: %v", err)
+	}
+	if !updateCalled {
+		t.Error("Update should be called to add finalizer")
+	}
+	if updatedObj == nil {
+		t.Fatal("Updated object should not be nil")
+	}
+
+	// Check finalizer was added
+	finalizers := updatedObj.GetFinalizers()
+	found := false
+	for _, f := range finalizers {
+		if f == FinalizerName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Finalizer %s should be added to object", FinalizerName)
+	}
+
+	// Should requeue to continue with sync
+	if !result.Requeue {
+		t.Error("Should requeue after adding finalizer")
+	}
+}
+
+func TestGenericReconciler_Reconcile_WithExistingFinalizer(t *testing.T) {
+	// When handler implements FinalizingHandler and object already has finalizer,
+	// it should proceed to Sync without adding finalizer again
+	syncCalled := false
+	updateCalled := false
+
+	handler := &testFinalizingHandler{
+		testHandler: testHandler{
+			syncFunc: func(ctx context.Context, obj *corev1.ConfigMap, sCtx *Context) (Result, error) {
+				syncCalled = true
+				return Stop(), nil
+			},
+		},
+	}
+
+	fc := &fakeClient{
+		getFunc: func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+			cm := obj.(*corev1.ConfigMap)
+			cm.Name = "test"
+			cm.Namespace = "default"
+			cm.Finalizers = []string{FinalizerName} // Already has finalizer
+			return nil
+		},
+		updateFunc: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+			updateCalled = true
+			return nil
+		},
+	}
+
+	reconciler := NewGenericReconciler[*corev1.ConfigMap](
+		fc,
+		handler,
+		runtime.NewScheme(),
+		&mockEventRecorder{},
+		logr.Discard(),
+	)
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "test"},
+	})
+
+	if err != nil {
+		t.Errorf("Reconcile should not return error, got: %v", err)
+	}
+	if !syncCalled {
+		t.Error("Sync should be called when finalizer already exists")
+	}
+	if updateCalled {
+		t.Error("Update should not be called when finalizer already exists")
+	}
+}
+
 func TestGenericReconciler_Reconcile_Deletion_NoFinalizer(t *testing.T) {
 	// Handler without FinalizingHandler should allow deletion
 	handler := &testHandler{
@@ -282,8 +431,11 @@ func TestGenericReconciler_Reconcile_Deletion_NoFinalizer(t *testing.T) {
 	}
 }
 
-func TestGenericReconciler_Reconcile_Deletion_WithFinalizer(t *testing.T) {
+func TestGenericReconciler_Reconcile_Deletion_WithFinalizer_Success(t *testing.T) {
+	// When deleting with finalizer and Finalize returns Stop(), finalizer should be removed
 	finalizeCalled := false
+	updateCalled := false
+	var updatedObj client.Object
 
 	handler := &testFinalizingHandler{
 		testHandler: testHandler{
@@ -295,7 +447,7 @@ func TestGenericReconciler_Reconcile_Deletion_WithFinalizer(t *testing.T) {
 	}
 	handler.finalizeFunc = func(ctx context.Context, obj *corev1.ConfigMap, sCtx *Context) (Result, error) {
 		finalizeCalled = true
-		return Stop(), nil
+		return Stop(), nil // Cleanup complete
 	}
 
 	now := metav1.Now()
@@ -304,6 +456,12 @@ func TestGenericReconciler_Reconcile_Deletion_WithFinalizer(t *testing.T) {
 			cm := obj.(*corev1.ConfigMap)
 			cm.Name = "test"
 			cm.DeletionTimestamp = &now
+			cm.Finalizers = []string{FinalizerName}
+			return nil
+		},
+		updateFunc: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+			updateCalled = true
+			updatedObj = obj
 			return nil
 		},
 	}
@@ -324,10 +482,122 @@ func TestGenericReconciler_Reconcile_Deletion_WithFinalizer(t *testing.T) {
 		t.Errorf("Reconcile should not return error, got: %v", err)
 	}
 	if !finalizeCalled {
-		t.Error("Finalize was not called")
+		t.Error("Finalize should be called")
 	}
+	if !updateCalled {
+		t.Error("Update should be called to remove finalizer")
+	}
+
+	// Check finalizer was removed
+	finalizers := updatedObj.GetFinalizers()
+	for _, f := range finalizers {
+		if f == FinalizerName {
+			t.Errorf("Finalizer %s should be removed from object", FinalizerName)
+		}
+	}
+
+	// Should not requeue
 	if result.Requeue || result.RequeueAfter != 0 {
-		t.Error("Reconcile should return empty result after successful finalization")
+		t.Error("Should not requeue after successful finalization")
+	}
+}
+
+func TestGenericReconciler_Reconcile_Deletion_WithFinalizer_Requeue(t *testing.T) {
+	// When deleting with finalizer and Finalize returns Requeue, finalizer should NOT be removed
+	finalizeCalled := false
+	updateCalled := false
+
+	handler := &testFinalizingHandler{}
+	handler.finalizeFunc = func(ctx context.Context, obj *corev1.ConfigMap, sCtx *Context) (Result, error) {
+		finalizeCalled = true
+		return Requeue(), nil // Cleanup not complete yet
+	}
+
+	now := metav1.Now()
+	fc := &fakeClient{
+		getFunc: func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+			cm := obj.(*corev1.ConfigMap)
+			cm.Name = "test"
+			cm.DeletionTimestamp = &now
+			cm.Finalizers = []string{FinalizerName}
+			return nil
+		},
+		updateFunc: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+			updateCalled = true
+			return nil
+		},
+	}
+
+	reconciler := NewGenericReconciler[*corev1.ConfigMap](
+		fc,
+		handler,
+		runtime.NewScheme(),
+		&mockEventRecorder{},
+		logr.Discard(),
+	)
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "test"},
+	})
+
+	if err != nil {
+		t.Errorf("Reconcile should not return error, got: %v", err)
+	}
+	if !finalizeCalled {
+		t.Error("Finalize should be called")
+	}
+	if updateCalled {
+		t.Error("Update should NOT be called when finalization is not complete")
+	}
+
+	// Should requeue
+	if !result.Requeue {
+		t.Error("Should requeue when finalization is not complete")
+	}
+}
+
+func TestGenericReconciler_Reconcile_Deletion_WithFinalizer_Error(t *testing.T) {
+	// When Finalize returns an error, finalizer should NOT be removed
+	expectedErr := errors.New("cleanup failed")
+	updateCalled := false
+
+	handler := &testFinalizingHandler{}
+	handler.finalizeFunc = func(ctx context.Context, obj *corev1.ConfigMap, sCtx *Context) (Result, error) {
+		return Stop(), expectedErr
+	}
+
+	now := metav1.Now()
+	fc := &fakeClient{
+		getFunc: func(ctx context.Context, key types.NamespacedName, obj client.Object, opts ...client.GetOption) error {
+			cm := obj.(*corev1.ConfigMap)
+			cm.Name = "test"
+			cm.DeletionTimestamp = &now
+			cm.Finalizers = []string{FinalizerName}
+			return nil
+		},
+		updateFunc: func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+			updateCalled = true
+			return nil
+		},
+	}
+
+	reconciler := NewGenericReconciler[*corev1.ConfigMap](
+		fc,
+		handler,
+		runtime.NewScheme(),
+		&mockEventRecorder{},
+		logr.Discard(),
+	)
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "test"},
+	})
+
+	if err != expectedErr {
+		t.Errorf("Reconcile should return finalize error, got: %v", err)
+	}
+	if updateCalled {
+		t.Error("Update should NOT be called when finalization fails with error")
 	}
 }
 
@@ -433,5 +703,12 @@ func TestGenericReconciler_newObject(t *testing.T) {
 	obj.Name = "test"
 	if obj.Name != "test" {
 		t.Error("newObject returned object that cannot be modified")
+	}
+}
+
+func TestFinalizerName(t *testing.T) {
+	// Verify the finalizer name constant
+	if FinalizerName != "streamline.io/finalizer" {
+		t.Errorf("FinalizerName should be 'streamline.io/finalizer', got %s", FinalizerName)
 	}
 }

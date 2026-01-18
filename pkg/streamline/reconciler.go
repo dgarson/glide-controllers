@@ -10,12 +10,18 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 )
+
+// FinalizerName is the finalizer string added to objects managed by Streamline
+// when the handler implements FinalizingHandler.
+const FinalizerName = "streamline.io/finalizer"
 
 // GenericReconciler is the core reconciliation engine that implements reconcile.Reconciler.
 // It handles the repetitive machinery of Kubernetes controllers:
 //   - Type instantiation via reflection
 //   - Object fetching with proper error handling
+//   - Automatic finalizer management for cleanup logic
 //   - Snapshot before handler execution for patch calculation
 //   - Lifecycle routing (deletion vs sync paths)
 //   - Smart status patching using MergePatch
@@ -40,6 +46,9 @@ type GenericReconciler[T client.Object] struct {
 
 	// objType holds the reflect.Type of T for instantiation.
 	objType reflect.Type
+
+	// isFinalizingHandler caches whether the handler implements FinalizingHandler.
+	isFinalizingHandler bool
 }
 
 // NewGenericReconciler creates a new GenericReconciler for the given handler.
@@ -66,13 +75,17 @@ func NewGenericReconciler[T client.Object](
 	var zero T
 	objType := reflect.TypeOf(zero).Elem()
 
+	// Check if handler implements FinalizingHandler at construction time
+	_, isFinalizingHandler := any(handler).(FinalizingHandler[T])
+
 	return &GenericReconciler[T]{
-		Client:        c,
-		Handler:       handler,
-		Scheme:        scheme,
-		EventRecorder: eventRecorder,
-		Log:           log,
-		objType:       objType,
+		Client:              c,
+		Handler:             handler,
+		Scheme:              scheme,
+		EventRecorder:       eventRecorder,
+		Log:                 log,
+		objType:             objType,
+		isFinalizingHandler: isFinalizingHandler,
 	}
 }
 
@@ -81,10 +94,11 @@ func NewGenericReconciler[T client.Object](
 //  1. Instantiate a new instance of T
 //  2. Fetch the object from the API server
 //  3. Handle NotFound (return nil, object was deleted)
-//  4. Snapshot the object for patch calculation
-//  5. Route to Sync or Finalize based on deletion state
-//  6. Calculate and apply status patch
-//  7. Translate and return result
+//  4. Manage finalizers (add/remove based on handler type and deletion state)
+//  5. Snapshot the object for patch calculation
+//  6. Route to Sync or Finalize based on deletion state
+//  7. Calculate and apply status patch
+//  8. Translate and return result
 func (r *GenericReconciler[T]) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("namespace", req.Namespace, "name", req.Name)
 	log.V(1).Info("starting reconciliation")
@@ -104,38 +118,109 @@ func (r *GenericReconciler[T]) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	// Step 3: Snapshot the object for patch calculation
-	original := obj.DeepCopyObject().(client.Object)
-
-	// Step 4: Create the streamline context for the handler
-	sCtx := NewContext(r.Client, log, r.EventRecorder, obj)
-
-	// Step 5: Route based on deletion state
-	var result Result
-	var err error
-
+	// Step 3: Check deletion state and manage finalizers
 	if !obj.GetDeletionTimestamp().IsZero() {
-		// Object is being deleted - route to finalization (Phase 3)
-		result, err = r.handleDeletion(ctx, obj, sCtx)
-	} else {
-		// Object is not being deleted - route to sync
-		result, err = r.handleSync(ctx, obj, sCtx)
+		// Object is being deleted
+		return r.reconcileDelete(ctx, obj, log)
 	}
 
+	// Object is not being deleted
+	return r.reconcileNormal(ctx, obj, log)
+}
+
+// reconcileNormal handles the normal (non-deletion) reconciliation path.
+// It ensures the finalizer is present if needed, then calls Sync.
+func (r *GenericReconciler[T]) reconcileNormal(ctx context.Context, obj T, log logr.Logger) (ctrl.Result, error) {
+	// Step 3a: If handler implements FinalizingHandler, ensure finalizer is present
+	if r.isFinalizingHandler {
+		if !controllerutil.ContainsFinalizer(obj, FinalizerName) {
+			log.V(1).Info("adding finalizer")
+			controllerutil.AddFinalizer(obj, FinalizerName)
+			if err := r.Client.Update(ctx, obj); err != nil {
+				log.Error(err, "failed to add finalizer")
+				return ctrl.Result{}, err
+			}
+			// Requeue to continue with sync after finalizer is added
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
+	// Step 4: Snapshot the object for patch calculation
+	original := obj.DeepCopyObject().(client.Object)
+
+	// Step 5: Create the streamline context for the handler
+	sCtx := NewContext(r.Client, log, r.EventRecorder, obj)
+
+	// Step 6: Call Sync
+	result, err := r.Handler.Sync(ctx, obj, sCtx)
 	if err != nil {
-		log.Error(err, "handler returned error")
+		log.Error(err, "sync returned error")
 		return ctrl.Result{}, err
 	}
 
-	// Step 6: Calculate and apply status patch if status changed
+	// Step 7: Calculate and apply status patch if status changed
 	if err := r.patchStatus(ctx, obj, original); err != nil {
 		log.Error(err, "failed to patch status")
 		return ctrl.Result{}, err
 	}
 
-	// Step 7: Translate and return result
+	// Step 8: Translate and return result
 	log.V(1).Info("reconciliation complete", "requeue", result.Requeue, "requeueAfter", result.RequeueAfter)
 	return result.ToCtrlResult(), nil
+}
+
+// reconcileDelete handles the deletion reconciliation path.
+// It calls Finalize if the handler supports it, then removes the finalizer.
+func (r *GenericReconciler[T]) reconcileDelete(ctx context.Context, obj T, log logr.Logger) (ctrl.Result, error) {
+	log.V(1).Info("object is being deleted")
+
+	// Check if our finalizer is present
+	if !controllerutil.ContainsFinalizer(obj, FinalizerName) {
+		// Finalizer not present, nothing to do
+		log.V(1).Info("finalizer not present, allowing deletion")
+		return ctrl.Result{}, nil
+	}
+
+	// Finalizer is present, need to handle cleanup
+	if r.isFinalizingHandler {
+		// Step 4: Snapshot the object for patch calculation
+		original := obj.DeepCopyObject().(client.Object)
+
+		// Step 5: Create the streamline context for the handler
+		sCtx := NewContext(r.Client, log, r.EventRecorder, obj)
+
+		// Step 6: Call Finalize
+		fh := any(r.Handler).(FinalizingHandler[T])
+		result, err := fh.Finalize(ctx, obj, sCtx)
+		if err != nil {
+			log.Error(err, "finalize returned error")
+			return ctrl.Result{}, err
+		}
+
+		// Step 7: Patch status before checking result
+		if err := r.patchStatus(ctx, obj, original); err != nil {
+			log.Error(err, "failed to patch status")
+			return ctrl.Result{}, err
+		}
+
+		// Check if finalization is complete
+		if !result.IsZero() {
+			// Finalization not complete, requeue
+			log.V(1).Info("finalization not complete, requeueing", "requeue", result.Requeue, "requeueAfter", result.RequeueAfter)
+			return result.ToCtrlResult(), nil
+		}
+	}
+
+	// Finalization complete (or no finalizing handler), remove finalizer
+	log.V(1).Info("removing finalizer")
+	controllerutil.RemoveFinalizer(obj, FinalizerName)
+	if err := r.Client.Update(ctx, obj); err != nil {
+		log.Error(err, "failed to remove finalizer")
+		return ctrl.Result{}, err
+	}
+
+	log.V(1).Info("finalizer removed, deletion can proceed")
+	return ctrl.Result{}, nil
 }
 
 // newObject creates a new instance of T using reflection.
@@ -144,27 +229,6 @@ func (r *GenericReconciler[T]) newObject() T {
 	// Create a new instance of the underlying struct type
 	newObj := reflect.New(r.objType).Interface()
 	return newObj.(T)
-}
-
-// handleSync routes to the Handler's Sync method.
-// This is called when the object is not being deleted.
-func (r *GenericReconciler[T]) handleSync(ctx context.Context, obj T, sCtx *Context) (Result, error) {
-	return r.Handler.Sync(ctx, obj, sCtx)
-}
-
-// handleDeletion handles objects marked for deletion.
-// If the handler implements FinalizingHandler, it calls Finalize.
-// Otherwise, it returns Stop() to allow deletion to proceed.
-// Note: Full finalizer management is implemented in Phase 3.
-func (r *GenericReconciler[T]) handleDeletion(ctx context.Context, obj T, sCtx *Context) (Result, error) {
-	// Check if handler implements FinalizingHandler
-	if fh, ok := any(r.Handler).(FinalizingHandler[T]); ok {
-		return fh.Finalize(ctx, obj, sCtx)
-	}
-
-	// Handler doesn't implement FinalizingHandler, allow deletion
-	sCtx.Log.V(1).Info("handler does not implement FinalizingHandler, allowing deletion")
-	return Stop(), nil
 }
 
 // patchStatus calculates the diff between original and current object,
